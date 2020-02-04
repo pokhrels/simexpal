@@ -218,19 +218,12 @@ def compile_manifest(run):
 
 def invoke_run(manifest):
 	# Create the output file. This signals that the run has been started.
-	(stdout_pipe, stdout) = (None, None)
+	stdout = None
 	with open(manifest.output_file_path('out'), "w") as f:
 		# We do not actually need to write anything to the output file.
 		# However, we might want to pipe experimental output to it.
 		if manifest.output == 'stdout':
 			stdout = os.dup(f.fileno())
-		else:
-			(stdout_pipe, stdout) = os.pipe()
-			os.set_blocking(stdout_pipe, False)
-
-	# Create the error file.
-	(stderr_pipe, stderr) = os.pipe()
-	os.set_blocking(stderr_pipe, False)
 
 	def substitute(p):
 		if p == 'INSTANCE':
@@ -239,6 +232,8 @@ def invoke_run(manifest):
 			return str(manifest.repetition)
 		elif p == 'OUTPUT':
 			return manifest.output_file_path('out')
+		elif p == 'OUTPUT_SUBDIR':
+			return manifest.output_subdir
 		else:
 			return None
 
@@ -272,14 +267,13 @@ def invoke_run(manifest):
 
 		def progress(self):
 			# Specify some chunk size to avoid reading the whole pipe at once.
-			chunk = os.read(self._fd, 16 * 1024)
+			chunk = self._fd.read(16 * 1024)
 			if not len(chunk):
 				return False
 
 			if self._out is None:
 				self._out = open(self._path, "wb")
 			self._out.write(chunk)
-			self._out.flush()
 			return True
 
 		def close(self):
@@ -287,16 +281,14 @@ def invoke_run(manifest):
 				self._out.close()
 
 	start = time.perf_counter()
-	cwd = manifest.workdir if manifest.workdir is not None else manifest.base_dir
+	cwd = (util.expand_at_params(manifest.workdir, substitute) 
+			if manifest.workdir is not None else manifest.base_dir)
 	child = subprocess.Popen(cmd, cwd=cwd, env=environ,
-			stdout=stdout, stderr=stderr)
+			stdout=stdout, stderr=subprocess.PIPE)
 	sel = selectors.DefaultSelector()
 
-	if manifest.output != 'stdout':
-		stdout_writer = LazyWriter(stdout_pipe, manifest.aux_file_path('stdout'))
-		sel.register(stdout_pipe, selectors.EVENT_READ, stdout_writer)
-	stderr_writer = LazyWriter(stderr_pipe, manifest.aux_file_path('stderr'))
-	sel.register(stderr_pipe, selectors.EVENT_READ, stderr_writer)
+	stderr_writer = LazyWriter(child.stderr, manifest.aux_file_path('stderr'))
+	sel.register(child.stderr, selectors.EVENT_READ, stderr_writer)
 
 	# Wait until the run program finishes.
 	while True:
@@ -321,8 +313,6 @@ def invoke_run(manifest):
 				sel.unregister(sk.fd)
 		if not events:
 			break
-	if manifest.output != 'stdout':
-		stdout_writer.close()
 	stderr_writer.close()
 	runtime = time.perf_counter() - start
 
